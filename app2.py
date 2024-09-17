@@ -1,95 +1,101 @@
-import os
-from dotenv import load_dotenv
 import streamlit as st
-from PIL import Image
+from PyPDF2 import PdfReader # type: ignore
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import os
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
-import pdfplumber 
+from langchain.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI 
+from langchain.chains.question_answering import load_qa_chain
+from langchain.prompts import PromptTemplate
+from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
-
-# Configure Google API key for Generative AI
+os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Function to get a response from the Gemini model
-def get_gemini_response(input, data, prompt):
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    response = model.generate_content([input, data, prompt])
+def get_pdf_text(pdf_docs):
+    text=""
+    for pdf in pdf_docs:
+        pdf_reader= PdfReader(pdf)
+        for page in pdf_reader.pages:
+            text+= page.extract_text()
+    return  text
 
-    # Check if candidates are available
-    if hasattr(response, "candidates") and response.candidates:
-        candidate = response.candidates[0]  # Get the first candidate
-        
-        # Check if the candidate has parts and extract the text from 'parts'
-        if hasattr(candidate, "parts"):
-            # Extract the text from each part
-            parts_text = [part.text for part in candidate.parts if hasattr(part, "text")]
-            return " ".join(parts_text) if parts_text else "No 'text' field found in parts"
-        else:
-            return "No 'parts' field found in response"
-    else:
-        return "No response from Gemini model"
 
-# Function to prepare images for the model
-def input_image_setup(uploaded_files):
-    image_parts = []
-    for uploaded_file in uploaded_files:
-        # Read the file into bytes
-        bytes_data = uploaded_file.getvalue()
-        image_parts.append({
-            "mime_type": uploaded_file.type,  # Get the mime type of the uploaded file
-            "data": bytes_data
-        })
-    return image_parts
 
-# Function to extract text from PDF using pdfplumber
-def extract_text_from_pdf(pdf_file):
-    with pdfplumber.open(pdf_file) as pdf:
-        full_text = ""
-        for page in pdf.pages:
-            full_text += page.extract_text()  # Extract text from each page
-    return full_text
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
+    chunks = text_splitter.split_text(text)
+    return chunks
 
-# Streamlit app setup
-st.set_page_config(page_title="Gemini Invoice Extractor")
 
-st.header("Invoice Extractor")
+def get_vector_store(text_chunks):
+    embeddings = GoogleGenerativeAIEmbeddings(model = "models/embedding-001")
+    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    vector_store.save_local("faiss_index")
 
-# Input prompt from the user
-input_text = st.text_input("Enter your question about the invoices:", key="input")
 
-# Allow multiple file uploads (both images and PDFs)
-uploaded_files = st.file_uploader("Choose invoice files...", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True)
+def get_conversational_chain():
 
-# Initialize a list to store responses
-responses = []
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
+    provided context just say, "answer is not available in the context", don't provide the wrong answer\n\n
+    Context:\n {context}?\n
+    Question: \n{question}\n
 
-# Display and process uploaded files
-if uploaded_files:
-    for file in uploaded_files:
-        if file.type in ["application/pdf"]:
-            # Extract text from PDF
-            pdf_text = extract_text_from_pdf(file)
-            st.write(f"Uploaded PDF: {file.name}")
-            st.write("Extracted Text:")
-            st.write(pdf_text)
-            image_data = pdf_text
-        else:
-            # Display image
-            image = Image.open(file)
-            st.image(image, caption=f"Uploaded Image: {file.name}", use_column_width=True)
-            image_data = input_image_setup([file])
-        
-        # Store responses for each file
-        if file.type in ["application/pdf"]:
-            response = get_gemini_response(input_text, image_data, "Extract information from the PDF.")
-        else:
-            response = get_gemini_response(input_text, image_data[0], "Extract information from the image.")
-        
-        # Append response to the list with file name for reference
-        responses.append(f"{file.name}: {response}")
+    Answer:
+    """
+
+    model = ChatGoogleGenerativeAI(model="gemini-pro",
+                             temperature=0.3)
+
+    prompt = PromptTemplate(template = prompt_template, input_variables = ["context", "question"])
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+
+    return chain
+
+
+
+def user_input(user_question):
+    embeddings = GoogleGenerativeAIEmbeddings(model = "models/embedding-001")
     
-    # Display all responses collectively
-    st.subheader("Responses for all invoices:")
-    for response in responses:
-        st.write(response)
+    new_db = FAISS.load_local("faiss_index", embeddings)
+    docs = new_db.similarity_search(user_question)
+
+    chain = get_conversational_chain()
+
+    
+    response = chain(
+        {"input_documents":docs, "question": user_question}
+        , return_only_outputs=True)
+
+    print(response)
+    st.write("Reply: ", response["output_text"])
+
+
+
+
+def main():
+    st.set_page_config("Invoice Extractor")
+    st.header("Invoice Extractor for pdf")
+
+    user_question = st.text_input("Ask a Question from the PDF Files")
+
+    if user_question:
+        user_input(user_question)
+
+    with st.sidebar:
+        st.title("Menu:")
+        pdf_docs = st.file_uploader("Upload your PDF Files and Click on the Submit & Process Button", accept_multiple_files=True)
+        if st.button("Submit & Analyze"):
+            with st.spinner("Processing..."):
+                raw_text = get_pdf_text(pdf_docs)
+                text_chunks = get_text_chunks(raw_text)
+                get_vector_store(text_chunks)
+                st.success("Done")
+
+
+
+if __name__ == "__main__":
+    main()
